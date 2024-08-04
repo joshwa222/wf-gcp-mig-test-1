@@ -1,0 +1,144 @@
+main:
+  params: [args]
+  steps:
+  - createSnapshot:
+      call: googleapis.compute.v1.disks.createSnapshot
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        disk: ${args.disk_name}
+        body:
+          name: ${args.snapshot_name}
+          storageLocations: ["asia-south1"]
+      result: snapshotOperation
+
+  - waitForSnapshotOperation:
+      call: sys.sleep
+      args:
+        seconds: 5
+
+  - checkSnapshotStatus:
+      call: googleapis.compute.v1.zoneOperations.get
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        operation: ${snapshotOperation.name}
+      result: snapshotOperationStatus
+
+  - checkSnapshotCompletion:
+      switch:
+        - condition: ${snapshotOperationStatus.status == "DONE"}
+          next: createImageFromSnapshot
+        - condition: ${snapshotOperationStatus.status != "DONE"}
+          next: waitForSnapshotOperation
+
+  - createImageFromSnapshot:
+      call: googleapis.compute.v1.images.insert
+      args:
+        project: ${args.project_id}
+        body:
+          name: ${args.image_name}
+          sourceSnapshot: ${args.snapshot_name}
+      result: imageOperation
+
+  - waitForImageOperation:
+      call: googleapis.compute.v1.globalOperations.wait
+      args:
+        project: ${args.project_id}
+        operation: ${imageOperation.name}
+      result: imageOperationStatus
+
+  - checkImageCompletion:
+      switch:
+        - condition: ${imageOperationStatus.status == "DONE"}
+          next: getOldInstanceTemplate
+        - condition: ${imageOperationStatus.status != "DONE"}
+          next: waitForImageOperation
+
+  - getOldInstanceTemplate:  
+      call: googleapis.compute.v1.instanceTemplates.get
+      args:
+        project: ${args.project_id}
+        instanceTemplate: ${args.instance_template_name}
+      result: oldTemplatedetails
+
+  - createInstanceTemplate:
+      call: googleapis.compute.v1.instanceTemplates.insert
+      args:
+        project: ${args.project_id}
+        body:
+          name: ${args.new_instance_template_name}
+          properties:
+            machineType: ${oldTemplatedetails.properties.machineType}
+            disks:
+              - boot: true
+                autoDelete: true
+                initializeParams:
+                  sourceImage: ${args.image_name}
+                  #diskSizeGb: 50
+                  #diskEncryptionKey:              #for adding cmek key for pie servers
+                    #kmsKeyName: projects/prj-pie-uat/locations/global/keyRings/my-keyring/cryptoKeys/key-prj-ua
+            networkInterfaces: ${oldTemplatedetails.properties.networkInterfaces}
+            tags: ${oldTemplatedetails.properties.tags}
+            metadata: ${oldTemplatedetails.properties.metadata}
+      result: instanceTemplateResult
+
+  - waitForInstanceTemplate:
+      call: googleapis.compute.v1.globalOperations.wait
+      args:
+        project: ${args.project_id}
+        operation: ${instanceTemplateResult.name}
+      result: instanceTemplateOperation
+
+  - updateInstanceGroup:
+      call: googleapis.compute.v1.instanceGroupManagers.patch
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        instanceGroupManager: ${args.instance_group_name}
+        body:
+          instanceTemplate: ${instanceTemplateResult.targetLink}
+      result: updateInstanceGroupOperation
+
+  - waitForInstanceGroupUpdate:
+      call: googleapis.compute.v1.zoneOperations.wait
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        operation: ${updateInstanceGroupOperation.name}
+      result: updateInstanceGroupStatus
+
+  - checkInstanceGroupUpdateCompletion:
+      switch:
+        - condition: ${updateInstanceGroupStatus.status == "DONE"}
+          next: replaceAndRestartVMs
+        - condition: ${updateInstanceGroupStatus.status != "DONE"}
+          next: waitForInstanceGroupUpdate
+
+  - replaceAndRestartVMs:
+      call: googleapis.compute.v1.instanceGroupManagers.recreateInstances
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        instanceGroupManager: ${args.instance_group_name}
+        body:
+          instances: [] #empty to replace all instances
+      result: recreateInstancesOperation
+
+  - waitForRecreateInstances:
+      call: googleapis.compute.v1.zoneOperations.wait
+      args:
+        project: ${args.project_id}
+        zone: ${args.zone}
+        operation: ${recreateInstancesOperation.name}
+      result: recreateInstancesStatus
+
+  - checkRecreateInstancesCompletion:
+      switch:
+        - condition: ${recreateInstancesStatus.status == "DONE"}
+          next: finish
+        - condition: ${recreateInstancesStatus.status != "DONE"}
+          next: waitForRecreateInstances
+
+  - finish:
+      return: "Instance group update and VM replacement completed successfully"
